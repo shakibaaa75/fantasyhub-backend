@@ -1,0 +1,42 @@
+# Environment Variables (SECRETS - NEVER PUSH)
+.env
+.env.local
+.env.production
+
+# Compiled Go binaries
+backend
+backend.exe
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+
+# Test binary, built with `go test -c`
+*.test
+
+# Output of go coverage tool
+*.out
+
+# Dependency directories
+vendor/
+
+# Go workspace file
+go.work
+
+# IDE & Editor files
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# Mac OS garbage
+.DS_Store
+.AppleDouble
+.LSOverride
+
+# Windows garbage
+Thumbs.db
+ehthumbs.db
+Desktop.ini

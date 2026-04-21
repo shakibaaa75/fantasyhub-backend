@@ -159,7 +159,9 @@ type User struct {
 	State       UserState       `json:"state"`
 	JoinedAt    time.Time       `json:"joined_at"`
 	QueuedAt    time.Time       `json:"queued_at,omitempty"`
-	mu          sync.Mutex
+	// Video call state
+	VideoEnabled bool `json:"video_enabled"`
+	mu           sync.Mutex
 }
 
 type Match struct {
@@ -171,6 +173,18 @@ type Match struct {
 	CreatedAt     time.Time `json:"created_at"`
 	User1QueuedAt time.Time `json:"user1_queued_at"`
 	User2QueuedAt time.Time `json:"user2_queued_at"`
+	// Video call metadata
+	Mode         string `json:"mode"`      // "chat" or "video"
+	Initiator    string `json:"initiator"` // UserID who creates the WebRTC offer
+	VideoQuality string `json:"video_quality,omitempty"`
+}
+
+// PartnerID returns the other user's ID in the match
+func (m *Match) PartnerID(userID string) string {
+	if userID == m.User1ID {
+		return m.User2ID
+	}
+	return m.User1ID
 }
 
 type Message struct {
@@ -180,6 +194,36 @@ type Message struct {
 	Content   string    `json:"content"`
 	Timestamp time.Time `json:"timestamp"`
 }
+
+// ============================================
+// WEBSOCKET MESSAGE TYPES
+// ============================================
+
+// WebSocket message type constants
+const (
+	MsgTypeFindMatch    = "find_match"
+	MsgTypeSearching    = "searching"
+	MsgTypeMatchFound   = "match_found"
+	MsgTypeChatMessage  = "chat_message"
+	MsgTypeTyping       = "typing"
+	MsgTypeSkip         = "skip"
+	MsgTypeSkipped      = "skipped"
+	MsgTypeDisconnected = "disconnected"
+	MsgTypeReport       = "report"
+	MsgTypeQueueUpdate  = "queue_update"
+	MsgTypeError        = "error"
+	MsgTypePong         = "pong"
+
+	// Video call signaling types
+	MsgTypeOffer        = "offer"
+	MsgTypeAnswer       = "answer"
+	MsgTypeICECandidate = "ice_candidate"
+	MsgTypeVideoReady   = "video_ready"
+	MsgTypePeerJoined   = "peer_joined"
+	MsgTypeVideoToggle  = "video_toggle"
+	MsgTypeAudioToggle  = "audio_toggle"
+	MsgTypeEndCall      = "end_call"
+)
 
 type WebSocketMessage struct {
 	Type      string      `json:"type"`
@@ -193,6 +237,7 @@ type FindMatchRequest struct {
 	Tags           []string `json:"tags"`
 	MinSimilarity  float64  `json:"min_similarity,omitempty"`
 	MaxWaitSeconds int      `json:"max_wait_seconds,omitempty"`
+	Mode           string   `json:"mode,omitempty"` // "chat" or "video"
 }
 
 type SendMessageRequest struct {
@@ -202,6 +247,32 @@ type SendMessageRequest struct {
 
 type ReportRequest struct {
 	Reason string `json:"reason"`
+}
+
+// WebRTC signaling payloads
+type SDPOffer struct {
+	SDP  string `json:"sdp"`
+	Type string `json:"type"`
+}
+
+type SDPAnswer struct {
+	SDP  string `json:"sdp"`
+	Type string `json:"type"`
+}
+
+type ICECandidate struct {
+	Candidate        string `json:"candidate"`
+	SDPMid           string `json:"sdpMid"`
+	SDPMLineIndex    int    `json:"sdpMLineIndex"`
+	UsernameFragment string `json:"usernameFragment,omitempty"`
+}
+
+type VideoTogglePayload struct {
+	Enabled bool `json:"enabled"`
+}
+
+type AudioTogglePayload struct {
+	Enabled bool `json:"enabled"`
 }
 
 type MatchConfig struct {
@@ -254,6 +325,8 @@ func NewMatch(user1ID, user2ID string, sharedTags []string, similarity float64) 
 		SharedTags: sharedTags,
 		Similarity: similarity,
 		CreatedAt:  time.Now(),
+		Mode:       "chat", // Default to chat, can be overridden
+		Initiator:  user1ID,
 	}
 }
 

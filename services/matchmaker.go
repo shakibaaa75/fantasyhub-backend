@@ -47,6 +47,7 @@ type CandidateScore struct {
 //   - Jaccard similarity scoring with configurable threshold
 //   - Fine-grained locking with no nested acquisitions (deadlock-free)
 //   - FIFO priority: users waiting longer get matched first among equal scores
+//   - Video mode matching: users with VideoEnabled=true are matched for video calls
 type Matchmaker struct {
 	// Configuration
 	config models.MatchConfig
@@ -136,8 +137,8 @@ func (m *Matchmaker) processEvents() {
 // lookup, then ranks candidates by (similarity score, wait time) and pairs
 // with the best match if the similarity threshold is met.
 //
-// This method is called by the event processor goroutine, ensuring serialized
-// access to matching logic without requiring a global lock during computation.
+// Video mode: If the requesting user has VideoEnabled=true, they will only be
+// matched with other video-enabled users. Chat-only users are filtered out.
 func (m *Matchmaker) tryMatchUser(userID string) {
 	m.mu.RLock()
 	user, exists := m.searchingUsers[userID]
@@ -146,12 +147,10 @@ func (m *Matchmaker) tryMatchUser(userID string) {
 		return
 	}
 	userTags := user.Tags
+	userWantsVideo := user.VideoEnabled
 	m.mu.RUnlock()
 
 	// Step 1: Use the tag reverse index to find candidate user IDs efficiently.
-	// Instead of scanning ALL searching users O(n), we only look at users who
-	// share at least one tag with the joining user — O(k) where k = total
-	// users indexed under the joining user's tags.
 	candidateIDs := m.findCandidatesByTags(userTags, userID)
 
 	if len(candidateIDs) == 0 {
@@ -160,11 +159,17 @@ func (m *Matchmaker) tryMatchUser(userID string) {
 	}
 
 	// Step 2: Score each candidate and rank them.
+	// For video mode, filter out non-video candidates.
 	var candidates []CandidateScore
 	m.mu.RLock()
 	for _, cid := range candidateIDs {
 		candidate, exists := m.searchingUsers[cid]
 		if !exists || candidate.State != models.StateSearching {
+			continue
+		}
+
+		// Video mode compatibility: both must want video, or both must want chat
+		if userWantsVideo != candidate.VideoEnabled {
 			continue
 		}
 
@@ -186,7 +191,7 @@ func (m *Matchmaker) tryMatchUser(userID string) {
 	m.mu.RUnlock()
 
 	if len(candidates) == 0 {
-		log.Printf("No compatible match for user %s above threshold %.2f", userID, m.config.MinSimilarity)
+		log.Printf("No compatible match for user %s above threshold %.2f (video=%v)", userID, m.config.MinSimilarity, userWantsVideo)
 		return
 	}
 
@@ -200,8 +205,7 @@ func (m *Matchmaker) tryMatchUser(userID string) {
 
 	best := candidates[0]
 
-	// Step 4: Atomically create the match. We must verify both users are still
-	// searching (they may have been matched by another concurrent event).
+	// Step 4: Atomically create the match.
 	created := m.atomicCreateMatch(userID, best.UserID, best.SharedTags, best.Similarity)
 	if created {
 		log.Printf("Match created: %s <-> %s (similarity: %.2f, shared: %v)",
@@ -236,15 +240,15 @@ func (m *Matchmaker) findCandidatesByTags(tags []string, excludeUserID string) [
 
 // atomicCreateMatch safely creates a match between two users, ensuring no race
 // conditions. It acquires the write lock, verifies both users are still searching,
-// creates the match, and removes both users from the search queue and tag index.
+// creates the match with video mode detection, and removes both users from the
+// search queue and tag index.
 // Returns true if the match was successfully created, false if either user was
 // no longer available.
 func (m *Matchmaker) atomicCreateMatch(user1ID, user2ID string, sharedTags []string, similarity float64) bool {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
-	// Re-verify both users are still searching (they may have been matched
-	// by a concurrent event or disconnected)
+	// Re-verify both users are still searching
 	user1, exists1 := m.searchingUsers[user1ID]
 	user2, exists2 := m.searchingUsers[user2ID]
 
@@ -264,6 +268,29 @@ func (m *Matchmaker) atomicCreateMatch(user1ID, user2ID string, sharedTags []str
 	match := models.NewMatch(user1ID, user2ID, sharedTags, similarity)
 	match.User1QueuedAt = user1.QueuedAt
 	match.User2QueuedAt = user2.QueuedAt
+
+	// Determine mode: if both users want video, use video mode
+	if user1.VideoEnabled && user2.VideoEnabled {
+		match.Mode = "video"
+		// Set video quality tier based on similarity
+		if similarity >= 0.8 {
+			match.VideoQuality = "hd"
+		} else if similarity >= 0.5 {
+			match.VideoQuality = "sd"
+		} else {
+			match.VideoQuality = "low"
+		}
+		// Randomize initiator to distribute WebRTC offer creation load
+		if time.Now().UnixNano()%2 == 0 {
+			match.Initiator = user1ID
+		} else {
+			match.Initiator = user2ID
+		}
+	} else {
+		match.Mode = "chat"
+		match.Initiator = ""
+		match.VideoQuality = ""
+	}
 
 	// Store match indexed by both user IDs for O(1) lookup
 	m.activeMatches[user1ID] = match
@@ -294,7 +321,7 @@ func (m *Matchmaker) AddUser(user *models.User) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	m.users[user.ID] = user
-	log.Printf("[Matchmaker] User %s registered (tags: %v)", user.ID, user.Tags)
+	log.Printf("[Matchmaker] User %s registered (tags: %v, video=%v)", user.ID, user.Tags, user.VideoEnabled)
 }
 
 // RemoveUser completely removes a user from the system: the global users map,
@@ -347,7 +374,8 @@ func (m *Matchmaker) EnqueueUser(user *models.User) {
 	m.addToTagIndexLocked(user.ID, user.Tags)
 	m.mu.Unlock()
 
-	log.Printf("[Matchmaker] User %s enqueued with tags: %v — triggering match event", user.ID, user.Tags)
+	log.Printf("[Matchmaker] User %s enqueued (mode=%v, tags=%v) — triggering match event",
+		user.ID, map[bool]string{true: "video", false: "chat"}[user.VideoEnabled], user.Tags)
 
 	// Non-blocking send to event channel. If the channel is full (burst scenario),
 	// we skip the event since the periodic cleanup and heartbeat will eventually
@@ -448,6 +476,17 @@ func (m *Matchmaker) GetQueueStats() map[string]interface{} {
 		tagCounts[tag] = len(m.tagIndex[tag])
 	}
 
+	// Count video vs chat users in queue
+	videoSearching := 0
+	chatSearching := 0
+	for _, user := range m.searchingUsers {
+		if user.VideoEnabled {
+			videoSearching++
+		} else {
+			chatSearching++
+		}
+	}
+
 	// Find longest wait time
 	var longestWait time.Duration
 	now := time.Now()
@@ -460,6 +499,8 @@ func (m *Matchmaker) GetQueueStats() map[string]interface{} {
 
 	return map[string]interface{}{
 		"searching_count":  len(m.searchingUsers),
+		"video_searching":  videoSearching,
+		"chat_searching":   chatSearching,
 		"online_count":     len(m.users),
 		"active_matches":   len(m.activeMatches) / 2, // Each match is stored twice
 		"tag_distribution": tagCounts,

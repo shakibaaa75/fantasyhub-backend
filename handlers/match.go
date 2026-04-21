@@ -22,7 +22,7 @@ func NewMatchHandler() *MatchHandler {
 }
 
 // GetMatchStatus returns whether a user is currently matched, and if so,
-// the match details including shared tags and similarity score.
+// the match details including shared tags, similarity score, and mode.
 // GET /api/match/status?user_id=xxx
 func (h *MatchHandler) GetMatchStatus(w http.ResponseWriter, r *http.Request) {
 	userID := r.URL.Query().Get("user_id")
@@ -42,10 +42,14 @@ func (h *MatchHandler) GetMatchStatus(w http.ResponseWriter, r *http.Request) {
 
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(map[string]interface{}{
-		"matched":     true,
-		"match_id":    match.ID,
-		"shared_tags": match.SharedTags,
-		"similarity":  match.Similarity,
+		"matched":       true,
+		"match_id":      match.ID,
+		"shared_tags":   match.SharedTags,
+		"similarity":    match.Similarity,
+		"mode":          match.Mode,
+		"initiator":     match.Initiator,
+		"video_quality": match.VideoQuality,
+		"partner_id":    match.PartnerID(userID),
 	})
 }
 
@@ -60,8 +64,11 @@ func (h *MatchHandler) GetOnlineCount(w http.ResponseWriter, r *http.Request) {
 }
 
 // GetTags returns the list of available interest tags that users can select.
-// GET /api/tags
+// Supports optional ?mode=video query param to include video-specific tags.
+// GET /api/tags?mode=video
 func (h *MatchHandler) GetTags(w http.ResponseWriter, r *http.Request) {
+	mode := r.URL.Query().Get("mode")
+
 	tags := []models.Tag{
 		{Name: "Gaming", Icon: "gamepad-2", Category: "fun"},
 		{Name: "Anime", Icon: "tv", Category: "fun"},
@@ -93,12 +100,24 @@ func (h *MatchHandler) GetTags(w http.ResponseWriter, r *http.Request) {
 		{Name: "Space", Icon: "orbit", Category: "tech"},
 	}
 
+	// Add video-specific tags when in video mode
+	if mode == "video" {
+		videoTags := []models.Tag{
+			{Name: "Face Cam", Icon: "video", Category: "video"},
+			{Name: "Voice Only", Icon: "mic", Category: "video"},
+			{Name: "Screen Share", Icon: "monitor", Category: "video"},
+			{Name: "Group Calls", Icon: "users", Category: "video"},
+		}
+		tags = append(tags, videoTags...)
+	}
+
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(tags)
 }
 
 // GetQueueStats returns detailed statistics about the search queue,
-// including searching count, tag distribution, and current configuration.
+// including searching count, tag distribution, video vs chat breakdown,
+// and current configuration.
 // GET /api/queue/stats
 func (h *MatchHandler) GetQueueStats(w http.ResponseWriter, r *http.Request) {
 	stats := h.matchmaker.GetQueueStats()

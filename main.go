@@ -35,7 +35,7 @@ func main() {
 
 	mux := http.NewServeMux()
 
-	// WebSocket endpoint
+	// WebSocket endpoint (handles chat + video call signaling)
 	mux.HandleFunc("/ws", wsHandler.HandleWebSocket)
 
 	// REST API endpoints
@@ -127,15 +127,15 @@ func printBanner() {
 	log.Println("Server starting on :8080")
 	log.Println("")
 	log.Println("WebSocket endpoint:")
-	log.Println("  ws://localhost:8080/ws")
+	log.Println("  ws://localhost:8080/ws  (chat + video call signaling)")
 	log.Println("")
 	log.Println("REST API endpoints:")
-	log.Println("  GET  /api/tags            - Available interest tags")
-	log.Println("  GET  /api/online/count    - Connected user count")
-	log.Println("  GET  /api/match/status    - Match status (query: user_id)")
-	log.Println("  GET  /api/queue/stats     - Queue statistics & config")
-	log.Println("  GET  /api/config          - Current matchmaking config")
-	log.Println("  POST /api/config/update   - Update config at runtime")
+	log.Println("  GET  /api/tags?mode=video - Available interest tags (+ video tags)")
+	log.Println("  GET  /api/online/count     - Connected user count")
+	log.Println("  GET  /api/match/status     - Match status (query: user_id)")
+	log.Println("  GET  /api/queue/stats      - Queue statistics & config")
+	log.Println("  GET  /api/config           - Current matchmaking config")
+	log.Println("  POST /api/config/update    - Update config at runtime")
 	log.Println("")
 	log.Println("Auth endpoints:")
 	log.Println("  POST /api/auth/register          - Email/password registration")
@@ -155,6 +155,7 @@ func printBanner() {
 	log.Println("")
 	log.Println("Architecture: Event-driven (channel-based, no polling)")
 	log.Println("Matching: Jaccard similarity with configurable threshold")
+	log.Println("Video: WebRTC P2P signaling via WebSocket (STUN/TURN ready)")
 	log.Println("Database: MongoDB (Fantisy cluster)")
 	log.Println("========================================")
 }

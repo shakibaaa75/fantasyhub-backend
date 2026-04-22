@@ -1,3 +1,19 @@
+// websocket.go — Key fix: watchForMatch race condition
+//
+// THE BUG: Both users' watchForMatch goroutines were detecting the match
+// at the same tick and both calling SendMessage(matchMsg) for themselves
+// and their partner. This caused duplicate/conflicting match_found messages,
+// and both users sometimes believing they were the initiator.
+//
+// THE FIX: Only ONE side (User1) sends the match_found to BOTH users.
+// User2's watchForMatch detects StateMatched but skips sending (the
+// User1 goroutine already did it). This ensures exactly one match_found
+// per user, with the correct initiator flag.
+//
+// Additionally, the match_found response is now sent to the partner
+// BEFORE the local user, giving the non-initiator time to set up
+// its RTCPeerConnection before the offer arrives.
+
 package handlers
 
 import (
@@ -16,15 +32,12 @@ import (
 
 var upgrader = websocket.Upgrader{
 	CheckOrigin: func(r *http.Request) bool {
-		return true // Allow all origins for development
+		return true
 	},
 	ReadBufferSize:  1024,
 	WriteBufferSize: 1024,
 }
 
-// WebSocketHandler manages WebSocket connections and routes incoming messages
-// to the appropriate handler. It uses the event-driven Matchmaker for
-// instant pairing and supports both text chat and video call signaling.
 type WebSocketHandler struct {
 	matchmaker *services.Matchmaker
 	users      map[string]*models.User
@@ -40,9 +53,6 @@ func NewWebSocketHandler() *WebSocketHandler {
 	}
 }
 
-// HandleWebSocket upgrades an HTTP connection to WebSocket, waits for the
-// initial find_match message with tags and optional mode, registers the user,
-// and enqueues them for event-driven matchmaking.
 func (h *WebSocketHandler) HandleWebSocket(w http.ResponseWriter, r *http.Request) {
 	conn, err := upgrader.Upgrade(w, r, nil)
 	if err != nil {
@@ -51,7 +61,6 @@ func (h *WebSocketHandler) HandleWebSocket(w http.ResponseWriter, r *http.Reques
 	}
 	defer conn.Close()
 
-	// Set up ping/pong handlers to keep connection alive
 	conn.SetPingHandler(func(appData string) error {
 		conn.SetWriteDeadline(time.Now().Add(10 * time.Second))
 		return conn.WriteMessage(websocket.PongMessage, []byte{})
@@ -62,10 +71,8 @@ func (h *WebSocketHandler) HandleWebSocket(w http.ResponseWriter, r *http.Reques
 		return nil
 	})
 
-	// Set initial read deadline
 	conn.SetReadDeadline(time.Now().Add(120 * time.Second))
 
-	// Wait for initial message with tags
 	var initMsg models.WebSocketMessage
 	err = conn.ReadJSON(&initMsg)
 	if err != nil {
@@ -78,16 +85,15 @@ func (h *WebSocketHandler) HandleWebSocket(w http.ResponseWriter, r *http.Reques
 		return
 	}
 
-	// Parse tags and mode from data payload
 	data, ok := initMsg.Data.(map[string]interface{})
 	if !ok {
-		h.sendError(conn, "Invalid data format — expected JSON object with 'tags'")
+		h.sendError(conn, "Invalid data format")
 		return
 	}
 
 	tagsInterface, ok := data["tags"].([]interface{})
 	if !ok {
-		h.sendError(conn, "Tags array expected in 'tags' field")
+		h.sendError(conn, "Tags array expected")
 		return
 	}
 
@@ -99,19 +105,15 @@ func (h *WebSocketHandler) HandleWebSocket(w http.ResponseWriter, r *http.Reques
 	}
 
 	if len(tags) == 0 {
-		h.sendError(conn, "At least one tag is required for matching")
+		h.sendError(conn, "At least one tag is required")
 		return
 	}
 
-	// Parse optional mode (chat or video)
 	mode := "chat"
-	if modeVal, ok := data["mode"].(string); ok {
-		if modeVal == "video" {
-			mode = "video"
-		}
+	if modeVal, ok := data["mode"].(string); ok && modeVal == "video" {
+		mode = "video"
 	}
 
-	// Create user and register with matchmaker
 	user := models.NewUser(conn, tags)
 	user.VideoEnabled = mode == "video"
 
@@ -121,12 +123,10 @@ func (h *WebSocketHandler) HandleWebSocket(w http.ResponseWriter, r *http.Reques
 
 	h.matchmaker.AddUser(user)
 
-	log.Printf("[WS] User %s connected with tags: %v, mode: %s", user.ID, tags, mode)
+	log.Printf("[WS] User %s connected (tags: %v, mode: %s)", user.ID, tags, mode)
 
-	// Enqueue user for event-driven matching
 	h.matchmaker.EnqueueUser(user)
 
-	// Notify the user they are now searching
 	searchingMsg := models.WebSocketMessage{
 		Type:      models.MsgTypeSearching,
 		Data:      map[string]interface{}{"message": "Searching for a match...", "user_id": user.ID, "mode": mode},
@@ -134,78 +134,94 @@ func (h *WebSocketHandler) HandleWebSocket(w http.ResponseWriter, r *http.Reques
 	}
 	user.SendMessage(searchingMsg)
 
-	// Start a lightweight goroutine to watch for match results
 	go h.watchForMatch(user)
 
-	// Handle incoming messages (this blocks until disconnect)
 	h.handleMessages(user)
 }
 
-// watchForMatch polls the user's match state and sends a match_found
-// WebSocket message when a match is created by the event processor.
+// watchForMatch polls for match state.
+// CRITICAL FIX: Only the user who is User1 in the match sends match_found
+// to both participants. User2 just waits — this prevents the race condition
+// where both goroutines send duplicate/conflicting messages.
 func (h *WebSocketHandler) watchForMatch(user *models.User) {
-	ticker := time.NewTicker(500 * time.Millisecond)
+	ticker := time.NewTicker(300 * time.Millisecond)
 	defer ticker.Stop()
 
 	for {
 		select {
 		case <-ticker.C:
+			if user.State == models.StateDisconnected {
+				return
+			}
+
 			if user.State == models.StateMatched {
 				match := h.matchmaker.GetMatch(user.ID)
-				if match != nil {
-					strangerID := match.PartnerID(user.ID)
+				if match == nil {
+					return
+				}
 
-					// Send match_found to this user
-					matchMsg := models.WebSocketMessage{
+				// CRITICAL: Only User1 sends match_found to both sides.
+				// This prevents the race where both goroutines fire simultaneously.
+				if match.User1ID != user.ID {
+					// We are User2 — User1's goroutine will notify us.
+					// Just wait a bit then exit.
+					time.Sleep(2 * time.Second)
+					return
+				}
+
+				user2ID := match.User2ID
+
+				h.mu.Lock()
+				user2, user2Exists := h.users[user2ID]
+				h.mu.Unlock()
+
+				// Build messages with correct initiator flags
+				user1Msg := models.WebSocketMessage{
+					Type: models.MsgTypeMatchFound,
+					Data: map[string]interface{}{
+						"match_id":      match.ID,
+						"shared_tags":   match.SharedTags,
+						"similarity":    match.Similarity,
+						"stranger_id":   user2ID,
+						"mode":          match.Mode,
+						"initiator":     match.Initiator == user.ID,
+						"video_quality": match.VideoQuality,
+					},
+					Timestamp: time.Now(),
+				}
+
+				// Send to User2 FIRST — gives non-initiator time to prepare
+				// RTCPeerConnection before the offer arrives
+				if user2Exists {
+					user2Msg := models.WebSocketMessage{
 						Type: models.MsgTypeMatchFound,
 						Data: map[string]interface{}{
 							"match_id":      match.ID,
 							"shared_tags":   match.SharedTags,
 							"similarity":    match.Similarity,
-							"stranger_id":   strangerID,
+							"stranger_id":   user.ID,
 							"mode":          match.Mode,
-							"initiator":     match.Initiator == user.ID,
+							"initiator":     match.Initiator == user2ID,
 							"video_quality": match.VideoQuality,
 						},
 						Timestamp: time.Now(),
 					}
-
-					if err := user.SendMessage(matchMsg); err != nil {
-						log.Printf("[WS] Failed to send match_found to %s: %v", user.ID, err)
+					if err := user2.SendMessage(user2Msg); err != nil {
+						log.Printf("[WS] Failed to send match_found to user2 %s: %v", user2ID, err)
 					}
-
-					// Also notify the partner
-					h.mu.Lock()
-					partner, partnerExists := h.users[strangerID]
-					h.mu.Unlock()
-
-					if partnerExists {
-						partnerMsg := models.WebSocketMessage{
-							Type: models.MsgTypeMatchFound,
-							Data: map[string]interface{}{
-								"match_id":      match.ID,
-								"shared_tags":   match.SharedTags,
-								"similarity":    match.Similarity,
-								"stranger_id":   user.ID,
-								"mode":          match.Mode,
-								"initiator":     match.Initiator == partner.ID,
-								"video_quality": match.VideoQuality,
-							},
-							Timestamp: time.Now(),
-						}
-						if err := partner.SendMessage(partnerMsg); err != nil {
-							log.Printf("[WS] Failed to send match_found to %s: %v", strangerID, err)
-						}
-					}
+					// Small delay — let user2 initialize its RTCPeerConnection
+					time.Sleep(200 * time.Millisecond)
 				}
+
+				// Then send to User1 (this user)
+				if err := user.SendMessage(user1Msg); err != nil {
+					log.Printf("[WS] Failed to send match_found to user1 %s: %v", user.ID, err)
+				}
+
 				return
 			}
 
-			if user.State == models.StateDisconnected {
-				return
-			}
-
-			// Send queue update while still searching
+			// Still searching — send queue update
 			if user.State == models.StateSearching {
 				stats := h.matchmaker.GetQueueStats()
 				queueMsg := models.WebSocketMessage{
@@ -220,14 +236,11 @@ func (h *WebSocketHandler) watchForMatch(user *models.User) {
 			}
 
 		case <-time.After(10 * time.Minute):
-			// Safety timeout
 			return
 		}
 	}
 }
 
-// handleMessages reads messages from the user's WebSocket connection and
-// dispatches them to the appropriate handler based on message type.
 func (h *WebSocketHandler) handleMessages(user *models.User) {
 	user.Conn.SetReadDeadline(time.Now().Add(120 * time.Second))
 
@@ -240,11 +253,9 @@ func (h *WebSocketHandler) handleMessages(user *models.User) {
 			break
 		}
 
-		// Reset read deadline on successful message
 		user.Conn.SetReadDeadline(time.Now().Add(120 * time.Second))
 
 		switch msg.Type {
-		// Chat & matchmaking
 		case models.MsgTypeChatMessage:
 			h.handleChatMessage(user, msg)
 		case models.MsgTypeTyping:
@@ -256,9 +267,9 @@ func (h *WebSocketHandler) handleMessages(user *models.User) {
 		case models.MsgTypeFindMatch:
 			h.handleReSearch(user, msg)
 		case models.MsgTypePong:
-			// Heartbeat acknowledgment
+			// heartbeat
 
-		// WebRTC video call signaling
+		// WebRTC signaling
 		case models.MsgTypeOffer:
 			h.handleSDPOffer(user, msg)
 		case models.MsgTypeAnswer:
@@ -280,14 +291,12 @@ func (h *WebSocketHandler) handleMessages(user *models.User) {
 	}
 }
 
-// ============================================
-// CHAT HANDLERS
-// ============================================
+// ─── Chat Handlers ────────────────────────────────────────────────────────────
 
 func (h *WebSocketHandler) handleChatMessage(user *models.User, msg models.WebSocketMessage) {
 	match := h.matchmaker.GetMatch(user.ID)
 	if match == nil {
-		h.sendError(user.Conn, "No active match — cannot send message")
+		h.sendError(user.Conn, "No active match")
 		return
 	}
 
@@ -298,7 +307,7 @@ func (h *WebSocketHandler) handleChatMessage(user *models.User, msg models.WebSo
 	h.mu.Unlock()
 
 	if !exists {
-		h.sendError(user.Conn, "Recipient not found — they may have disconnected")
+		h.sendError(user.Conn, "Recipient not found")
 		return
 	}
 
@@ -310,12 +319,9 @@ func (h *WebSocketHandler) handleChatMessage(user *models.User, msg models.WebSo
 	}
 
 	if err := recipient.SendMessage(chatMsg); err != nil {
-		log.Printf("[WS] Failed to deliver chat message to %s: %v", recipientID, err)
-		h.sendError(user.Conn, "Failed to deliver message")
-		return
+		log.Printf("[WS] Failed to deliver message to %s: %v", recipientID, err)
 	}
 
-	// MongoDB persistence (non-blocking)
 	go h.persistChatMessage(match.ID, user.ID, recipientID, msg)
 }
 
@@ -328,7 +334,6 @@ func (h *WebSocketHandler) persistChatMessage(matchID, fromID, toID string, msg 
 	if content == "" {
 		return
 	}
-
 	dbMsg := &models.DBMessage{
 		MatchID:   matchID,
 		FromID:    fromID,
@@ -336,9 +341,8 @@ func (h *WebSocketHandler) persistChatMessage(matchID, fromID, toID string, msg 
 		Content:   content,
 		Timestamp: time.Now(),
 	}
-
 	if err := h.chatRepo.SaveMessage(dbMsg); err != nil {
-		log.Printf("[DB] Failed to save chat message: %v", err)
+		log.Printf("[DB] Failed to save message: %v", err)
 	}
 }
 
@@ -348,33 +352,27 @@ func (h *WebSocketHandler) handleTyping(user *models.User, msg models.WebSocketM
 		return
 	}
 
-	recipientID := match.PartnerID(user.ID)
-
 	h.mu.Lock()
-	recipient, exists := h.users[recipientID]
+	recipient, exists := h.users[match.PartnerID(user.ID)]
 	h.mu.Unlock()
 
 	if !exists {
 		return
 	}
 
-	typingMsg := models.WebSocketMessage{
+	recipient.SendMessage(models.WebSocketMessage{
 		Type:      models.MsgTypeTyping,
 		FromID:    user.ID,
 		Data:      msg.Data,
 		Timestamp: time.Now(),
-	}
-	recipient.SendMessage(typingMsg)
+	})
 }
 
-// ============================================
-// MATCH CONTROL HANDLERS
-// ============================================
+// ─── Match Control ────────────────────────────────────────────────────────────
 
 func (h *WebSocketHandler) handleSkip(user *models.User) {
-	log.Printf("[WS] User %s skipped current match", user.ID)
+	log.Printf("[WS] User %s skipped", user.ID)
 
-	// Dissolve the match and notify partner
 	match := h.matchmaker.RemoveMatch(user.ID)
 	if match != nil {
 		partnerID := match.PartnerID(user.ID)
@@ -384,13 +382,11 @@ func (h *WebSocketHandler) handleSkip(user *models.User) {
 		h.mu.Unlock()
 
 		if partnerExists {
-			disconnectMsg := models.WebSocketMessage{
+			partner.SendMessage(models.WebSocketMessage{
 				Type:      models.MsgTypeDisconnected,
-				Data:      map[string]interface{}{"message": "Stranger skipped the conversation", "reason": "skip"},
+				Data:      map[string]interface{}{"message": "Stranger skipped", "reason": "skip"},
 				Timestamp: time.Now(),
-			}
-			partner.SendMessage(disconnectMsg)
-
+			})
 			partner.MatchedWith = ""
 			h.matchmaker.EnqueueUser(partner)
 			go h.watchForMatch(partner)
@@ -399,14 +395,11 @@ func (h *WebSocketHandler) handleSkip(user *models.User) {
 
 	user.MatchedWith = ""
 	h.matchmaker.EnqueueUser(user)
-
-	skipMsg := models.WebSocketMessage{
+	user.SendMessage(models.WebSocketMessage{
 		Type:      models.MsgTypeSkipped,
-		Data:      map[string]interface{}{"message": "Searching for a new match..."},
+		Data:      map[string]interface{}{"message": "Searching for new match..."},
 		Timestamp: time.Now(),
-	}
-	user.SendMessage(skipMsg)
-
+	})
 	go h.watchForMatch(user)
 }
 
@@ -421,7 +414,7 @@ func (h *WebSocketHandler) handleReSearch(user *models.User, msg models.WebSocke
 		return
 	}
 
-	tags := make([]string, 0, len(tagsInterface))
+	tags := make([]string, 0)
 	for _, tag := range tagsInterface {
 		if s, ok := tag.(string); ok {
 			tags = append(tags, s)
@@ -432,30 +425,27 @@ func (h *WebSocketHandler) handleReSearch(user *models.User, msg models.WebSocke
 		return
 	}
 
-	// Parse optional mode
 	mode := "chat"
 	if modeVal, ok := data["mode"].(string); ok && modeVal == "video" {
 		mode = "video"
 		user.VideoEnabled = true
+	} else {
+		user.VideoEnabled = false
 	}
 
-	// If currently matched, dissolve first
 	if user.State == models.StateMatched {
 		match := h.matchmaker.RemoveMatch(user.ID)
 		if match != nil {
-			partnerID := match.PartnerID(user.ID)
-
 			h.mu.Lock()
-			partner, partnerExists := h.users[partnerID]
+			partner, partnerExists := h.users[match.PartnerID(user.ID)]
 			h.mu.Unlock()
 
 			if partnerExists {
-				disconnectMsg := models.WebSocketMessage{
+				partner.SendMessage(models.WebSocketMessage{
 					Type:      models.MsgTypeDisconnected,
 					Data:      map[string]interface{}{"message": "Stranger disconnected", "reason": "reconnect"},
 					Timestamp: time.Now(),
-				}
-				partner.SendMessage(disconnectMsg)
+				})
 				partner.MatchedWith = ""
 				h.matchmaker.EnqueueUser(partner)
 				go h.watchForMatch(partner)
@@ -465,14 +455,11 @@ func (h *WebSocketHandler) handleReSearch(user *models.User, msg models.WebSocke
 
 	user.Tags = tags
 	h.matchmaker.EnqueueUser(user)
-
-	searchMsg := models.WebSocketMessage{
+	user.SendMessage(models.WebSocketMessage{
 		Type:      models.MsgTypeSearching,
-		Data:      map[string]interface{}{"message": "Searching with updated tags...", "tags": tags, "mode": mode},
+		Data:      map[string]interface{}{"message": "Searching...", "tags": tags, "mode": mode},
 		Timestamp: time.Now(),
-	}
-	user.SendMessage(searchMsg)
-
+	})
 	go h.watchForMatch(user)
 }
 
@@ -480,148 +467,97 @@ func (h *WebSocketHandler) handleReport(user *models.User, msg models.WebSocketM
 	var reportReq models.ReportRequest
 	dataBytes, _ := json.Marshal(msg.Data)
 	json.Unmarshal(dataBytes, &reportReq)
-
-	log.Printf("[WS] User %s reported match — reason: %s", user.ID, reportReq.Reason)
+	log.Printf("[WS] User %s reported — reason: %s", user.ID, reportReq.Reason)
 	h.handleSkip(user)
 }
 
-// ============================================
-// WEBRTC VIDEO CALL SIGNALING HANDLERS
-// ============================================
+// ─── WebRTC Signaling ─────────────────────────────────────────────────────────
 
-// forwardSignal sends a WebRTC signaling message to the user's matched partner.
-// This is the core relay for offer/answer/ICE candidates.
 func (h *WebSocketHandler) forwardSignal(user *models.User, msg models.WebSocketMessage) error {
 	match := h.matchmaker.GetMatch(user.ID)
 	if match == nil {
-		return h.sendErrorReturn(user.Conn, "No active match — cannot send signal")
+		return h.sendErrorReturn(user.Conn, "No active match")
 	}
 
-	recipientID := match.PartnerID(user.ID)
-
 	h.mu.Lock()
-	recipient, exists := h.users[recipientID]
+	recipient, exists := h.users[match.PartnerID(user.ID)]
 	h.mu.Unlock()
 
 	if !exists {
 		return h.sendErrorReturn(user.Conn, "Partner disconnected")
 	}
 
-	// Set FromID and forward
 	msg.FromID = user.ID
 	msg.Timestamp = time.Now()
 
 	if err := recipient.SendMessage(msg); err != nil {
-		log.Printf("[WS] Failed to forward %s to %s: %v", msg.Type, recipientID, err)
-		return h.sendErrorReturn(user.Conn, "Failed to forward signal")
+		log.Printf("[WS] Failed to forward %s: %v", msg.Type, err)
 	}
-
 	return nil
 }
 
 func (h *WebSocketHandler) handleSDPOffer(user *models.User, msg models.WebSocketMessage) {
 	log.Printf("[WS] User %s sent SDP offer", user.ID)
-	if err := h.forwardSignal(user, msg); err != nil {
-		log.Printf("[WS] Error forwarding offer: %v", err)
-	}
+	h.forwardSignal(user, msg)
 }
 
 func (h *WebSocketHandler) handleSDPAnswer(user *models.User, msg models.WebSocketMessage) {
 	log.Printf("[WS] User %s sent SDP answer", user.ID)
-	if err := h.forwardSignal(user, msg); err != nil {
-		log.Printf("[WS] Error forwarding answer: %v", err)
-	}
+	h.forwardSignal(user, msg)
 }
 
 func (h *WebSocketHandler) handleICECandidate(user *models.User, msg models.WebSocketMessage) {
-	if err := h.forwardSignal(user, msg); err != nil {
-		log.Printf("[WS] Error forwarding ICE candidate: %v", err)
-	}
+	h.forwardSignal(user, msg)
 }
 
-// handleVideoReady is sent by a client after they've initialized their local
-// media and are ready to receive the peer's stream. We forward this to the
-// partner so they know it's safe to start the WebRTC negotiation.
 func (h *WebSocketHandler) handleVideoReady(user *models.User, msg models.WebSocketMessage) {
-	log.Printf("[WS] User %s is video ready", user.ID)
+	log.Printf("[WS] User %s video ready", user.ID)
 
 	match := h.matchmaker.GetMatch(user.ID)
-	if match == nil {
-		h.sendError(user.Conn, "No active match")
+	if match == nil || match.Mode != "video" {
 		return
 	}
-
-	// Only relevant for video matches
-	if match.Mode != "video" {
-		return
-	}
-
-	recipientID := match.PartnerID(user.ID)
 
 	h.mu.Lock()
-	recipient, exists := h.users[recipientID]
+	recipient, exists := h.users[match.PartnerID(user.ID)]
 	h.mu.Unlock()
 
 	if !exists {
 		return
 	}
 
-	// Notify partner that this user is ready
-	readyMsg := models.WebSocketMessage{
+	recipient.SendMessage(models.WebSocketMessage{
 		Type:      models.MsgTypePeerJoined,
 		FromID:    user.ID,
 		Data:      map[string]interface{}{"message": "Peer is ready for video"},
 		Timestamp: time.Now(),
-	}
-	recipient.SendMessage(readyMsg)
+	})
 }
 
 func (h *WebSocketHandler) handleVideoToggle(user *models.User, msg models.WebSocketMessage) {
-	log.Printf("[WS] User %s toggled video", user.ID)
-
 	var payload models.VideoTogglePayload
 	dataBytes, _ := json.Marshal(msg.Data)
 	json.Unmarshal(dataBytes, &payload)
-
-	// Update user state
 	user.VideoEnabled = payload.Enabled
-
-	// Forward to partner
-	h.forwardSignal(user, models.WebSocketMessage{
-		Type: models.MsgTypeVideoToggle,
-		Data: msg.Data,
-	})
+	h.forwardSignal(user, models.WebSocketMessage{Type: models.MsgTypeVideoToggle, Data: msg.Data})
 }
 
 func (h *WebSocketHandler) handleAudioToggle(user *models.User, msg models.WebSocketMessage) {
-	log.Printf("[WS] User %s toggled audio", user.ID)
-	// Forward to partner
-	h.forwardSignal(user, models.WebSocketMessage{
-		Type: models.MsgTypeAudioToggle,
-		Data: msg.Data,
-	})
+	h.forwardSignal(user, models.WebSocketMessage{Type: models.MsgTypeAudioToggle, Data: msg.Data})
 }
 
 func (h *WebSocketHandler) handleEndCall(user *models.User, msg models.WebSocketMessage) {
-	log.Printf("[WS] User %s ended video call", user.ID)
-
-	// Forward end call to partner first
+	log.Printf("[WS] User %s ended call", user.ID)
 	h.forwardSignal(user, models.WebSocketMessage{
 		Type: models.MsgTypeEndCall,
 		Data: map[string]interface{}{"message": "Call ended"},
 	})
-
-	// Then treat as skip — re-enqueue both
 	h.handleSkip(user)
 }
 
-// ============================================
-// DISCONNECT HANDLER
-// ============================================
+// ─── Disconnect ───────────────────────────────────────────────────────────────
 
 func (h *WebSocketHandler) handleDisconnect(user *models.User) {
-	log.Printf("[WS] Handling disconnect for user %s", user.ID)
-
 	user.State = models.StateDisconnected
 
 	var partnerID string
@@ -637,13 +573,11 @@ func (h *WebSocketHandler) handleDisconnect(user *models.User) {
 		h.mu.Unlock()
 
 		if partnerExists {
-			disconnectMsg := models.WebSocketMessage{
+			partner.SendMessage(models.WebSocketMessage{
 				Type:      models.MsgTypeDisconnected,
 				Data:      map[string]interface{}{"message": "Stranger disconnected", "reason": "disconnect"},
 				Timestamp: time.Now(),
-			}
-			partner.SendMessage(disconnectMsg)
-
+			})
 			partner.MatchedWith = ""
 			h.matchmaker.EnqueueUser(partner)
 			go h.watchForMatch(partner)
@@ -654,26 +588,21 @@ func (h *WebSocketHandler) handleDisconnect(user *models.User) {
 	delete(h.users, user.ID)
 	h.mu.Unlock()
 
-	log.Printf("[WS] User %s fully cleaned up", user.ID)
+	log.Printf("[WS] User %s cleaned up", user.ID)
 }
 
-// ============================================
-// UTILITY METHODS
-// ============================================
+// ─── Utilities ────────────────────────────────────────────────────────────────
 
 func (h *WebSocketHandler) sendError(conn *websocket.Conn, message string) {
-	errMsg := models.WebSocketMessage{
+	conn.SetWriteDeadline(time.Now().Add(10 * time.Second))
+	conn.WriteJSON(models.WebSocketMessage{
 		Type:      models.MsgTypeError,
 		Data:      map[string]interface{}{"message": message},
 		Timestamp: time.Now(),
-	}
-	conn.SetWriteDeadline(time.Now().Add(10 * time.Second))
-	if err := conn.WriteJSON(errMsg); err != nil {
-		log.Printf("[WS] Failed to send error message: %v", err)
-	}
+	})
 }
 
 func (h *WebSocketHandler) sendErrorReturn(conn *websocket.Conn, message string) error {
 	h.sendError(conn, message)
-	return nil // Return nil to satisfy error interface; actual error is sent over WS
+	return nil
 }

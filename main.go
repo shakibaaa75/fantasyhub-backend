@@ -81,9 +81,16 @@ func main() {
 
 	handler := corsHandler.Handler(mux)
 
+	// Render (and most PaaS providers) assign the port dynamically via $PORT.
+	// Falls back to 8080 for local development.
+	port := os.Getenv("PORT")
+	if port == "" {
+		port = "8080"
+	}
+
 	// Create HTTP server with timeouts
 	server := &http.Server{
-		Addr:         ":8080",
+		Addr:         ":" + port,
 		Handler:      handler,
 		ReadTimeout:  15 * time.Second,
 		WriteTimeout: 15 * time.Second,
@@ -92,7 +99,7 @@ func main() {
 
 	// Start server in goroutine
 	go func() {
-		printBanner()
+		printBanner(port)
 		if err := server.ListenAndServe(); err != nil && err != http.ErrServerClosed {
 			log.Fatalf("❌ Server failed to start: %v", err)
 		}
@@ -120,14 +127,14 @@ func main() {
 	log.Println("✅ Server stopped gracefully")
 }
 
-func printBanner() {
+func printBanner(port string) {
 	log.Println("========================================")
 	log.Println("  Event-Driven Matchmaking Server")
 	log.Println("========================================")
-	log.Println("Server starting on :8080")
+	log.Printf("Server starting on :%s\n", port)
 	log.Println("")
 	log.Println("WebSocket endpoint:")
-	log.Println("  ws://localhost:8080/ws  (chat + video call signaling)")
+	log.Printf("  ws://localhost:%s/ws  (chat + video call signaling)\n", port)
 	log.Println("")
 	log.Println("REST API endpoints:")
 	log.Println("  GET  /api/tags?mode=video - Available interest tags (+ video tags)")
